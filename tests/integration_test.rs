@@ -237,3 +237,43 @@ fn test_multi_extract_with_set_cost() {
     assert!(output.contains("(Add (Num 3) (Num 3))"));
     assert!(!output.contains("Mul"));
 }
+
+#[test]
+fn test_multi_extract_cse() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    // Create two terms that share a large subexpression (Add (Add (Num 1) (Num 2)) (Num 3))
+    // which has size >= 4, so it should be let-bound when shared.
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            "
+        (with-dynamic-cost
+            (datatype E (Add E E) (Mul E E) (Num i64))
+        )
+
+        (let shared (Add (Add (Num 1) (Num 2)) (Num 3)))
+        (let x (Add shared (Num 4)))
+        (let y (Mul shared (Num 5)))
+
+        (multi-extract 1 x y)",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    let output = result[0].to_string();
+    // The shared subexpression should be let-bound with a __ prefix to avoid name conflicts
+    assert!(
+        output.contains("(let __"),
+        "Expected CSE let-binding with __ prefix in output, got:\n{output}"
+    );
+    // The let-bound name should appear in both terms
+    let let_line = output.lines().find(|l| l.starts_with("(let __")).unwrap();
+    let let_name = let_line.split_whitespace().nth(1).unwrap();
+    // Count how many times the let-bound variable name appears (should be at least 2 uses + 1 binding)
+    let usage_count = output.matches(let_name).count();
+    assert!(
+        usage_count >= 3,
+        "Expected let-bound variable '{let_name}' to appear at least 3 times, found {usage_count} in:\n{output}"
+    );
+}
