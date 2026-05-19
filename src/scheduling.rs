@@ -23,10 +23,16 @@ struct ScheduleState {
 
 lazy_static! {
     static ref scheduler_libs: Mutex<HashMap<String, SchedulerBuilder>> = {
-        Mutex::new(HashMap::from_iter([(
-            "back-off".into(),
-            Box::new(schedulers::new_back_off_scheduler) as SchedulerBuilder,
-        )]))
+        Mutex::new(HashMap::from_iter([
+            (
+                "back-off".into(),
+                Box::new(schedulers::new_back_off_scheduler) as SchedulerBuilder,
+            ),
+            (
+                "capped-back-off".into(),
+                Box::new(schedulers::new_capped_back_off_scheduler) as SchedulerBuilder,
+            ),
+        ]))
     };
 }
 
@@ -232,39 +238,46 @@ mod schedulers {
     use std::collections::HashMap;
 
     use egglog::{
+        ExecutionState,
         ast::{Expr, Literal},
         scheduler::{Matches, Scheduler},
+        util::INTERNAL_SYMBOL_PREFIX,
     };
     use log::{debug, info};
 
     use crate::parse_tags;
+
+    /// Sum of non-internal function table sizes, matching `(get-size!)`.
+    fn current_size(state: &ExecutionState<'_>) -> usize {
+        state
+            .table_ids()
+            .filter_map(|table_id| {
+                let name = state.table_name(table_id)?;
+                if name.starts_with(INTERNAL_SYMBOL_PREFIX) {
+                    return None;
+                }
+                Some(state.get_table(table_id).len())
+            })
+            .sum()
+    }
+
+    fn usize_tag(tags: &HashMap<String, Literal>, name: &str) -> Option<usize> {
+        tags.get(name).map(|lit| {
+            let Literal::Int(n) = lit else {
+                panic!("Invalid {}: {:?}", name, lit);
+            };
+            *n as usize
+        })
+    }
 
     pub(super) fn new_back_off_scheduler(
         _egraph: &egglog::EGraph,
         args: &[Expr],
     ) -> Box<dyn Scheduler> {
         let tags = parse_tags(args);
-        let default_match_limit = tags
-            .get(":match-limit")
-            .map(|lit| {
-                let Literal::Int(n) = lit else {
-                    panic!("Invalid match limit: {:?}", lit);
-                };
-                *n as usize
-            })
-            .unwrap_or(1000);
-        let default_ban_length = tags
-            .get(":ban-length")
-            .map(|lit| {
-                let Literal::Int(n) = lit else {
-                    panic!("Invalid ban length: {:?}", lit);
-                };
-                *n as usize
-            })
-            .unwrap_or(5);
         Box::new(BackOffScheduler {
-            default_match_limit,
-            default_ban_length,
+            default_match_limit: usize_tag(&tags, ":match-limit").unwrap_or(1000),
+            default_ban_length: usize_tag(&tags, ":ban-length").unwrap_or(5),
             stats: HashMap::new(),
         })
     }
@@ -286,6 +299,11 @@ mod schedulers {
         ban_length: usize,
     }
 
+    enum BackOffDecision {
+        Ban,
+        Admit,
+    }
+
     impl BackOffScheduler {
         fn get_stats(&mut self, rule: String) -> &mut RuleStats {
             self.stats.entry(rule).or_insert_with(|| RuleStats {
@@ -296,6 +314,46 @@ mod schedulers {
                 ban_length: self.default_ban_length,
                 iteration: 0,
             })
+        }
+
+        fn stats_len(&self) -> usize {
+            self.stats.len()
+        }
+
+        fn decide(&mut self, rule: &str, match_size: usize) -> BackOffDecision {
+            let stats = self.get_stats(rule.to_owned());
+            stats.iteration += 1;
+
+            if stats.iteration < stats.banned_until {
+                debug!(
+                    "Skipping {} ({}-{}), banned until {}...",
+                    rule, stats.times_applied, stats.times_banned, stats.banned_until,
+                );
+                return BackOffDecision::Ban;
+            }
+
+            let threshold = stats
+                .match_limit
+                .checked_shl(stats.times_banned as u32)
+                .unwrap();
+            if match_size > threshold {
+                let ban_length = stats.ban_length << stats.times_banned;
+                stats.times_banned += 1;
+                stats.banned_until = stats.iteration + ban_length;
+                info!(
+                    "Banning {} ({}-{}) for {} iters: {} < {}",
+                    rule,
+                    stats.times_applied,
+                    stats.times_banned,
+                    ban_length,
+                    threshold,
+                    match_size,
+                );
+                BackOffDecision::Ban
+            } else {
+                stats.times_applied += 1;
+                BackOffDecision::Admit
+            }
         }
     }
 
@@ -356,40 +414,99 @@ mod schedulers {
             result
         }
 
-        fn filter_matches(&mut self, rule: &str, _ruleset: &str, matches: &mut Matches) -> bool {
-            let stats = self.get_stats(rule.to_owned());
-            stats.iteration += 1;
+        fn filter_matches(
+            &mut self,
+            _state: &ExecutionState<'_>,
+            rule: &str,
+            _ruleset: &str,
+            matches: &mut Matches,
+        ) -> bool {
+            match self.decide(rule, matches.match_size()) {
+                BackOffDecision::Ban => false,
+                BackOffDecision::Admit => {
+                    debug!("Choosing all matches for {}", rule);
+                    matches.choose_all();
+                    true
+                }
+            }
+        }
+    }
 
-            if stats.iteration < stats.banned_until {
-                debug!(
-                    "Skipping {} ({}-{}), banned until {}...",
-                    rule, stats.times_applied, stats.times_banned, stats.banned_until,
-                );
+    pub(super) fn new_capped_back_off_scheduler(
+        _egraph: &egglog::EGraph,
+        args: &[Expr],
+    ) -> Box<dyn Scheduler> {
+        let tags = parse_tags(args);
+        let node_cap = usize_tag(&tags, ":node-cap")
+            .expect("capped-back-off scheduler requires :node-cap argument");
+        // `granularity` is the per-rule per-iter ceiling on chosen matches.
+        // Smaller values tighten the cap (less overshoot when actions add
+        // more than one enode) at the cost of more iters. Default is
+        // node_cap/10.
+        let granularity = usize_tag(&tags, ":granularity")
+            .unwrap_or(node_cap / 10)
+            .max(1);
+        Box::new(CappedBackOffScheduler {
+            inner: BackOffScheduler {
+                default_match_limit: usize_tag(&tags, ":match-limit").unwrap_or(1000),
+                default_ban_length: usize_tag(&tags, ":ban-length").unwrap_or(5),
+                stats: HashMap::new(),
+            },
+            node_cap,
+            granularity,
+            cap_hit: false,
+        })
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct CappedBackOffScheduler {
+        inner: BackOffScheduler,
+        node_cap: usize,
+        granularity: usize,
+        cap_hit: bool,
+    }
+
+    impl Scheduler for CappedBackOffScheduler {
+        fn can_stop(&mut self, rules: &[&str], ruleset: &str) -> bool {
+            if self.cap_hit {
+                return true;
+            }
+            self.inner.can_stop(rules, ruleset)
+        }
+
+        fn filter_matches(
+            &mut self,
+            state: &ExecutionState<'_>,
+            rule: &str,
+            _ruleset: &str,
+            matches: &mut Matches,
+        ) -> bool {
+            let size = current_size(state);
+            if size >= self.node_cap {
+                if !self.cap_hit {
+                    info!("Capped: node cap reached ({} >= {})", size, self.node_cap);
+                    self.cap_hit = true;
+                }
                 return false;
             }
 
-            let threshold = stats
-                .match_limit
-                .checked_shl(stats.times_banned as u32)
-                .unwrap();
-            let total_len: usize = matches.match_size();
-            if total_len > threshold {
-                let ban_length = stats.ban_length << stats.times_banned;
-                stats.times_banned += 1;
-                stats.banned_until = stats.iteration + ban_length;
-                info!(
-                    "Banning {} ({}-{}) for {} iters: {} < {}",
-                    rule, stats.times_applied, stats.times_banned, ban_length, threshold, total_len,
-                );
-                false
-            } else {
-                stats.times_applied += 1;
-                debug!(
-                    "Choosing all matches for {} ({}-{})",
-                    rule, stats.times_applied, stats.times_banned
-                );
-                matches.choose_all();
-                true
+            let total = matches.match_size();
+            match self.inner.decide(rule, total) {
+                BackOffDecision::Ban => false,
+                BackOffDecision::Admit => {
+                    let n = self.inner.stats_len().max(1);
+                    let per_rule_granularity = self.granularity.div_ceil(n);
+                    let per_rule_budget = (self.node_cap - size).div_ceil(n);
+                    let to_choose = total.min(per_rule_granularity).min(per_rule_budget);
+                    for i in 0..to_choose {
+                        matches.choose(i);
+                    }
+                    debug!(
+                        "Capped: chose {}/{} for {} (size {}/{}, n_rules {})",
+                        to_choose, total, rule, size, self.node_cap, n,
+                    );
+                    to_choose == total
+                }
             }
         }
     }
