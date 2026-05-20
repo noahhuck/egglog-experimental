@@ -496,8 +496,7 @@ mod schedulers {
                 BackOffDecision::Admit => {
                     let n = self.inner.stats_len().max(1);
                     let per_rule_granularity = self.granularity.div_ceil(n);
-                    let per_rule_budget = (self.node_cap - size).div_ceil(n);
-                    let to_choose = total.min(per_rule_granularity).min(per_rule_budget);
+                    let to_choose = total.min(per_rule_granularity);
                     for i in 0..to_choose {
                         matches.choose(i);
                     }
