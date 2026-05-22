@@ -316,10 +316,6 @@ mod schedulers {
             })
         }
 
-        fn stats_len(&self) -> usize {
-            self.stats.len()
-        }
-
         fn decide(&mut self, rule: &str, match_size: usize) -> BackOffDecision {
             let stats = self.get_stats(rule.to_owned());
             stats.iteration += 1;
@@ -439,13 +435,6 @@ mod schedulers {
         let tags = parse_tags(args);
         let node_cap = usize_tag(&tags, ":node-cap")
             .expect("capped-back-off scheduler requires :node-cap argument");
-        // `granularity` is the per-rule per-iter ceiling on chosen matches.
-        // Smaller values tighten the cap (less overshoot when actions add
-        // more than one enode) at the cost of more iters. Default is
-        // node_cap/10.
-        let granularity = usize_tag(&tags, ":granularity")
-            .unwrap_or(node_cap / 10)
-            .max(1);
         Box::new(CappedBackOffScheduler {
             inner: BackOffScheduler {
                 default_match_limit: usize_tag(&tags, ":match-limit").unwrap_or(1000),
@@ -453,7 +442,6 @@ mod schedulers {
                 stats: HashMap::new(),
             },
             node_cap,
-            granularity,
             cap_hit: false,
         })
     }
@@ -462,7 +450,6 @@ mod schedulers {
     pub struct CappedBackOffScheduler {
         inner: BackOffScheduler,
         node_cap: usize,
-        granularity: usize,
         cap_hit: bool,
     }
 
@@ -478,7 +465,7 @@ mod schedulers {
             &mut self,
             state: &ExecutionState<'_>,
             rule: &str,
-            _ruleset: &str,
+            ruleset: &str,
             matches: &mut Matches,
         ) -> bool {
             let size = current_size(state);
@@ -489,24 +476,7 @@ mod schedulers {
                 }
                 return false;
             }
-
-            let total = matches.match_size();
-            match self.inner.decide(rule, total) {
-                BackOffDecision::Ban => false,
-                BackOffDecision::Admit => {
-                    let n = self.inner.stats_len().max(1);
-                    let per_rule_granularity = self.granularity.div_ceil(n);
-                    let to_choose = total.min(per_rule_granularity);
-                    for i in 0..to_choose {
-                        matches.choose(i);
-                    }
-                    debug!(
-                        "Capped: chose {}/{} for {} (size {}/{}, n_rules {})",
-                        to_choose, total, rule, size, self.node_cap, n,
-                    );
-                    to_choose == total
-                }
-            }
+            self.inner.filter_matches(state, rule, ruleset, matches)
         }
     }
 }
