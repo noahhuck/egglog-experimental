@@ -238,28 +238,12 @@ mod schedulers {
     use std::collections::HashMap;
 
     use egglog::{
-        ExecutionState,
         ast::{Expr, Literal},
         scheduler::{Matches, Scheduler},
-        util::INTERNAL_SYMBOL_PREFIX,
     };
     use log::{debug, info};
 
     use crate::parse_tags;
-
-    /// Sum of non-internal function table sizes, matching `(get-size!)`.
-    fn current_size(state: &ExecutionState<'_>) -> usize {
-        state
-            .table_ids()
-            .filter_map(|table_id| {
-                let name = state.table_name(table_id)?;
-                if name.starts_with(INTERNAL_SYMBOL_PREFIX) {
-                    return None;
-                }
-                Some(state.get_table(table_id).len())
-            })
-            .sum()
-    }
 
     fn usize_tag(tags: &HashMap<String, Literal>, name: &str) -> Option<usize> {
         tags.get(name).map(|lit| {
@@ -412,7 +396,6 @@ mod schedulers {
 
         fn filter_matches(
             &mut self,
-            _state: &ExecutionState<'_>,
             rule: &str,
             _ruleset: &str,
             matches: &mut Matches,
@@ -433,50 +416,10 @@ mod schedulers {
         args: &[Expr],
     ) -> Box<dyn Scheduler> {
         let tags = parse_tags(args);
-        let node_cap = usize_tag(&tags, ":node-cap")
-            .expect("capped-back-off scheduler requires :node-cap argument");
-        Box::new(CappedBackOffScheduler {
-            inner: BackOffScheduler {
-                default_match_limit: usize_tag(&tags, ":match-limit").unwrap_or(1000),
-                default_ban_length: usize_tag(&tags, ":ban-length").unwrap_or(5),
-                stats: HashMap::new(),
-            },
-            node_cap,
-            cap_hit: false,
+        Box::new(BackOffScheduler {
+            default_match_limit: usize_tag(&tags, ":match-limit").unwrap_or(1000),
+            default_ban_length: usize_tag(&tags, ":ban-length").unwrap_or(5),
+            stats: HashMap::new(),
         })
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct CappedBackOffScheduler {
-        inner: BackOffScheduler,
-        node_cap: usize,
-        cap_hit: bool,
-    }
-
-    impl Scheduler for CappedBackOffScheduler {
-        fn can_stop(&mut self, rules: &[&str], ruleset: &str) -> bool {
-            if self.cap_hit {
-                return true;
-            }
-            self.inner.can_stop(rules, ruleset)
-        }
-
-        fn filter_matches(
-            &mut self,
-            state: &ExecutionState<'_>,
-            rule: &str,
-            ruleset: &str,
-            matches: &mut Matches,
-        ) -> bool {
-            let size = current_size(state);
-            if size >= self.node_cap {
-                if !self.cap_hit {
-                    info!("Capped: node cap reached ({} >= {})", size, self.node_cap);
-                    self.cap_hit = true;
-                }
-                return false;
-            }
-            self.inner.filter_matches(state, rule, ruleset, matches)
-        }
     }
 }
