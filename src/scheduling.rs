@@ -29,8 +29,8 @@ lazy_static! {
                 Box::new(schedulers::new_back_off_scheduler) as SchedulerBuilder,
             ),
             (
-                "capped-back-off".into(),
-                Box::new(schedulers::new_capped_back_off_scheduler) as SchedulerBuilder,
+                "round-robin-back-off".into(),
+                Box::new(schedulers::new_round_robin_back_off_scheduler) as SchedulerBuilder,
             ),
         ]))
     };
@@ -235,7 +235,7 @@ pub(crate) fn parse_tags(args: &[Expr]) -> HashMap<String, Literal> {
 }
 
 mod schedulers {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use egglog::{
         ast::{Expr, Literal},
@@ -411,15 +411,111 @@ mod schedulers {
         }
     }
 
-    pub(super) fn new_capped_back_off_scheduler(
+    pub(super) fn new_round_robin_back_off_scheduler(
         _egraph: &egglog::EGraph,
         args: &[Expr],
     ) -> Box<dyn Scheduler> {
         let tags = parse_tags(args);
-        Box::new(BackOffScheduler {
-            default_match_limit: usize_tag(&tags, ":match-limit").unwrap_or(1000),
-            default_ban_length: usize_tag(&tags, ":ban-length").unwrap_or(5),
-            stats: HashMap::new(),
+        Box::new(RoundRobinBackoffScheduler {
+            backoff: BackOffScheduler {
+                default_match_limit: usize_tag(&tags, ":match-limit").unwrap_or(1000),
+                default_ban_length: usize_tag(&tags, ":ban-length").unwrap_or(5),
+                stats: HashMap::new(),
+            },
+            rule_order: Vec::new(),
+            phase: Phase::Cache,
+            seen_this_call: HashSet::new(),
+            any_collected_this_cycle: false,
         })
+    }
+
+    // Applies one rule's matches per `step_rules_with_scheduler` call, wrapped
+    // around a `BackOffScheduler`. Each cycle is `#rules + 1` calls:
+    //   Cache call:      queries run; all matches stay as residuals (chosen: none).
+    //   Drain(i) calls:  no re-query; rule_order[i]'s residuals are passed to the
+    //                    inner BackOffScheduler, which decides ban/admit.
+    // The caller's `:until` is evaluated between phases, so the egraph size is
+    // sampled `#rules` times more often than under the default scheduler.
+    #[derive(Debug, Clone)]
+    pub struct RoundRobinBackoffScheduler {
+        backoff: BackOffScheduler,
+        rule_order: Vec<String>,
+        phase: Phase,
+        seen_this_call: HashSet<String>,
+        any_collected_this_cycle: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    enum Phase {
+        #[default]
+        Cache,
+        Drain(usize),
+    }
+
+    impl RoundRobinBackoffScheduler {
+        fn advance(&mut self) {
+            let n = self.rule_order.len();
+            self.phase = match self.phase {
+                Phase::Cache if n > 0 => Phase::Drain(0),
+                Phase::Cache => Phase::Cache,
+                Phase::Drain(i) if i + 1 < n => Phase::Drain(i + 1),
+                Phase::Drain(_) => {
+                    self.any_collected_this_cycle = false;
+                    Phase::Cache
+                }
+            };
+        }
+    }
+
+    impl Scheduler for RoundRobinBackoffScheduler {
+        fn can_stop(&mut self, rules: &[&str], ruleset: &str) -> bool {
+            // Mid-cycle or fresh Cache that collected matches: not saturated.
+            if self.phase != Phase::Cache || self.any_collected_this_cycle {
+                return false;
+            }
+            // End of cycle, no new matches — defer to BackOff for ban fast-forward.
+            self.backoff.can_stop(rules, ruleset)
+        }
+
+        fn filter_matches(
+            &mut self,
+            rule: &str,
+            ruleset: &str,
+            matches: &mut Matches,
+        ) -> bool {
+            // Re-seeing a rule means a new step_rules_with_scheduler call started.
+            if self.seen_this_call.contains(rule) {
+                self.advance();
+                self.seen_this_call.clear();
+            }
+            self.seen_this_call.insert(rule.to_string());
+
+            match self.phase {
+                Phase::Cache => {
+                    if !self.rule_order.iter().any(|r| r == rule) {
+                        self.rule_order.push(rule.to_string());
+                    }
+                    if matches.match_size() > 0 {
+                        self.any_collected_this_cycle = true;
+                    }
+                    debug!(
+                        "round-robin-back-off cache: {} ({} matches buffered)",
+                        rule,
+                        matches.match_size()
+                    );
+                    false
+                }
+                Phase::Drain(idx) => {
+                    let is_last = idx + 1 == self.rule_order.len();
+                    if self.rule_order.get(idx).is_some_and(|r| r == rule) {
+                        // BackOff inspects the residual count and bans / admits accordingly.
+                        // Its return value (should_seek) is ignored — we control re-query timing.
+                        let _ = self.backoff.filter_matches(rule, ruleset, matches);
+                    }
+                    // Re-seek only on the last drain so the next call's Cache re-queries.
+                    is_last
+                }
+            }
+        }
     }
 }
