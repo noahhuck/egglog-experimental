@@ -1,10 +1,10 @@
 use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
-    CommandOutput, UserDefinedCommand,
     ast::{Expr, Fact, Facts, Literal, ParseError},
     prelude::{query, run_ruleset},
     scheduler::{Scheduler, SchedulerId},
+    CommandOutput, UserDefinedCommand,
 };
 use egglog_reports::RunReport;
 use lazy_static::lazy_static;
@@ -289,6 +289,12 @@ mod schedulers {
     }
 
     impl BackOffScheduler {
+        pub(super) fn is_banned(&self, rule: &str) -> bool {
+            self.stats
+                .get(rule)
+                .is_some_and(|s| s.iteration < s.banned_until)
+        }
+
         fn get_stats(&mut self, rule: String) -> &mut RuleStats {
             self.stats.entry(rule).or_insert_with(|| RuleStats {
                 times_applied: 0,
@@ -345,7 +351,7 @@ mod schedulers {
             let mut banned: Vec<(&str, RuleStats)> = rules
                 .iter()
                 .filter_map(|rule| {
-                    let s = stats.remove(*rule).unwrap();
+                    let s = stats.remove(*rule)?;
                     if s.banned_until > s.iteration {
                         Some((*rule, s))
                     } else {
@@ -394,12 +400,7 @@ mod schedulers {
             result
         }
 
-        fn filter_matches(
-            &mut self,
-            rule: &str,
-            _ruleset: &str,
-            matches: &mut Matches,
-        ) -> bool {
+        fn filter_matches(&mut self, rule: &str, _ruleset: &str, matches: &mut Matches) -> bool {
             match self.decide(rule, matches.match_size()) {
                 BackOffDecision::Ban => false,
                 BackOffDecision::Admit => {
@@ -477,12 +478,7 @@ mod schedulers {
             self.backoff.can_stop(rules, ruleset)
         }
 
-        fn filter_matches(
-            &mut self,
-            rule: &str,
-            ruleset: &str,
-            matches: &mut Matches,
-        ) -> bool {
+        fn filter_matches(&mut self, rule: &str, ruleset: &str, matches: &mut Matches) -> bool {
             // Re-seeing a rule means a new step_rules_with_scheduler call started.
             if self.seen_this_call.contains(rule) {
                 self.advance();
@@ -508,12 +504,11 @@ mod schedulers {
                 Phase::Drain(idx) => {
                     let is_last = idx + 1 == self.rule_order.len();
                     if self.rule_order.get(idx).is_some_and(|r| r == rule) {
-                        // BackOff inspects the residual count and bans / admits accordingly.
-                        // Its return value (should_seek) is ignored — we control re-query timing.
                         let _ = self.backoff.filter_matches(rule, ruleset, matches);
                     }
-                    // Re-seek only on the last drain so the next call's Cache re-queries.
-                    is_last
+                    // Re-seek on the last drain for every rule that isn't currently banned,
+                    // so the next Cache call skips queries for banned rules.
+                    is_last && !self.backoff.is_banned(rule)
                 }
             }
         }
