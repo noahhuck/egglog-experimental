@@ -1,10 +1,10 @@
 use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
-    ast::{Expr, Fact, Facts, Literal, ParseError},
-    prelude::{query, run_ruleset},
+    CommandOutput, Error, UserDefinedCommand,
+    ast::{Command, Expr, Fact, Literal, ParseError},
+    prelude::run_ruleset,
     scheduler::{Scheduler, SchedulerId},
-    CommandOutput, UserDefinedCommand,
 };
 use egglog_reports::RunReport;
 use lazy_static::lazy_static;
@@ -43,6 +43,20 @@ pub fn add_scheduler_builder(name: String, builder: SchedulerBuilder) {
 impl ScheduleState {
     fn new() -> Self {
         Self { schedulers: vec![] }
+    }
+
+    // temp fix, may want to change something in egglog
+    fn evaluate_until(
+        &mut self,
+        egraph: &mut egglog::EGraph,
+        cond: &Expr,
+    ) -> Result<bool, egglog::Error> {
+        let check = Command::Check(cond.span(), vec![Fact::Fact(cond.clone())]);
+        match egraph.run_program(vec![check]) {
+            Ok(_) => Ok(true),
+            Err(Error::CheckError(..)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     // Current limitation: because it relies on the publicly available Rust APIs to access
@@ -129,9 +143,7 @@ impl ScheduleState {
                 };
 
                 if let Some(until) = until {
-                    // Parse the facts from the `until` expression
-                    let res = query(egraph, &[], Facts(vec![Fact::Fact(until)]))?;
-                    if res.any_matches() {
+                    if self.evaluate_until(egraph, &until)? {
                         return Ok(RunReport::default());
                     }
                 }
@@ -470,12 +482,9 @@ mod schedulers {
 
     impl Scheduler for RoundRobinBackoffScheduler {
         fn can_stop(&mut self, rules: &[&str], ruleset: &str) -> bool {
-            // Mid-cycle or fresh Cache that collected matches: not saturated.
-            if self.phase != Phase::Cache || self.any_collected_this_cycle {
-                return false;
-            }
-            // End of cycle, no new matches — defer to BackOff for ban fast-forward.
-            self.backoff.can_stop(rules, ruleset)
+            self.phase == Phase::Cache
+                && !self.any_collected_this_cycle
+                && self.backoff.can_stop(rules, ruleset)
         }
 
         fn filter_matches(&mut self, rule: &str, ruleset: &str, matches: &mut Matches) -> bool {
