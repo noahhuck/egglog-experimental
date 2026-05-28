@@ -439,6 +439,7 @@ mod schedulers {
             phase: Phase::Cache,
             seen_this_call: HashSet::new(),
             any_collected_this_cycle: false,
+            started: false,
         })
     }
 
@@ -449,6 +450,8 @@ mod schedulers {
     //                    inner BackOffScheduler, which decides ban/admit.
     // The caller's `:until` is evaluated between phases, so the egraph size is
     // sampled `#rules` times more often than under the default scheduler.
+    //
+    // The scheduler depends on the ruleset size/order, so a new scheduler should be created per ruleset.
     #[derive(Debug, Clone)]
     pub struct RoundRobinBackoffScheduler {
         backoff: BackOffScheduler,
@@ -456,6 +459,7 @@ mod schedulers {
         phase: Phase,
         seen_this_call: HashSet<String>,
         any_collected_this_cycle: bool,
+        started: bool,
     }
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -497,7 +501,7 @@ mod schedulers {
 
             match self.phase {
                 Phase::Cache => {
-                    if !self.rule_order.iter().any(|r| r == rule) {
+                    if !self.started {
                         self.rule_order.push(rule.to_string());
                     }
                     if matches.match_size() > 0 {
@@ -511,6 +515,7 @@ mod schedulers {
                     false
                 }
                 Phase::Drain(idx) => {
+                    self.started = true;
                     let is_last = idx + 1 == self.rule_order.len();
                     if self.rule_order.get(idx).is_some_and(|r| r == rule) {
                         let _ = self.backoff.filter_matches(rule, ruleset, matches);
